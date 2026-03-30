@@ -130,7 +130,7 @@ for r in results:
         print(r.label, "→", r.markdown_path)
 ```
 
-#### Extraction + GPT-5 captioning
+#### Extraction + GPT captioning
 
 ```python
 from ocr import ocr
