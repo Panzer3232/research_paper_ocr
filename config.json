@@ -1,0 +1,33 @@
+{
+  "mineru": {
+    "command": "mineru",
+    "backend": "pipeline",
+    "extra_args": []
+  },
+  "captioning": {
+    "enabled": false,
+    "max_retries": 2,
+    "timeout_seconds": 180,
+    "caption_prompt": "Analyze this research paper figure and provide a detailed description under 300 characters. Focus on: 1. Chart/Diagram Type 2. Main trend or component demonstrated 3. Key data points or structural elements. Keep it concise but detailed enough for understanding without the image."
+  },
+  "apis": {
+    "openai_api_version": "2023-05-15",
+    "openai_model": "gpt-5-2025-08-07"
+  },
+  "resume": {
+    "enabled": true,
+    "skip_completed_stages": true
+  },
+  "output": {
+    "root_dir": "data_ocr",
+    "input_dir_name": "input",
+    "manifests_dir_name": "manifests",
+    "mineru_raw_dir_name": "mineru_raw",
+    "markdown_dir_name": "markdown",
+    "captioned_markdown_dir_name": "captioned_markdown"
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": null
+  }
+}
