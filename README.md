@@ -10,7 +10,7 @@ A pipeline for extracting structured Markdown from research paper PDFs using [Mi
 
 1. Accepts a single PDF file or a folder of PDF files as input.
 2. Runs MinerU OCR on each PDF and produces a clean `.md` file per paper.
-3. Optionally captions every figure/image in the markdown using GPT-5 (Azure OpenAI), producing a separate captioned `.md` file.
+3. Optionally captions every figure/image in the markdown using GPT , producing a separate captioned `.md` file.
 4. Saves all outputs under `data_ocr/` with a structured layout.
 5. Writes a per-paper JSON manifest for resume support — interrupted runs pick up from where they stopped.
 
