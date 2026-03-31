@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+_PACKAGE_ROOT = Path(__file__).parent.resolve()
+if str(_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PACKAGE_ROOT))
 
 from app.config.loader import load_config
 from app.config.models import PipelineConfig
@@ -16,9 +22,29 @@ logging.getLogger("paper_ocr").addHandler(logging.NullHandler())
 _BUNDLED_CONFIG = Path(__file__).parent / "config.json"
 
 
+def enable_logging(level: str = "INFO", log_file: str | None = None) -> None:
+   
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+
+    fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+    for name in ("paper_ocr", "app.extract.captioner", "httpx"):
+        lg = logging.getLogger(name)
+        lg.setLevel(getattr(logging, level.upper(), logging.INFO))
+        lg.handlers = []
+        for h in handlers:
+            h.setFormatter(logging.Formatter(fmt))
+            lg.addHandler(h)
+        lg.propagate = False
+
+
+
 @dataclass(frozen=True)
 class OCRPipelineResult:
-   
+    
+
     pdf_path: str
     success: bool
     markdown_path: str | None
@@ -28,7 +54,9 @@ class OCRPipelineResult:
     label: str
 
     def effective_markdown(self) -> str | None:
-        
+        """
+        Return the best available markdown path for this result.
+        """
         return self.captioned_path or self.markdown_path
 
 
@@ -105,7 +133,6 @@ def _to_public_result(r: OCRResult) -> OCRPipelineResult:
         status=r.status,
         label=r.label,
     )
-
 
 def ocr(
     input_path: str | Path,
