@@ -207,7 +207,21 @@ failed    = [r for r in results if not r.success]
 for r in failed:
     print(f"FAILED: {r.label} | status={r.status} | error={r.error}")
 ```
+#### Example test script, with logging functionality
 
+```python
+from OCR_extraction_pipeline.ocr import ocr, enable_logging
+
+enable_logging()
+
+results = ocr("/path/to/pdfs/", caption=True)
+
+for r in results:
+    if r.success:
+        print(r.markdown_path)      # absolute path to .md file
+    else:
+        print(r.label, r.error)
+```
 ---
 
 ## `OCRPipelineResult` reference
