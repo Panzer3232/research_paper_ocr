@@ -67,7 +67,7 @@ All outputs are written under `data_ocr/` relative to the working directory (or 
 data_ocr/
 ├── markdown/               # Plain MinerU-extracted .md files (one per PDF)
 ├── captioned_markdown/     # GPT-captioned .md files (one per PDF, if --caption enabled)
-├── structured_json/        # RAG-ready structured .json files (one per PDF, if --export-json enabled)
+├── structured_json/        # structured .json files (one per PDF, if --export-json enabled)
 ├── mineru_raw/             # Raw MinerU output: images, content_list.json, middle.json, layout PDF
 ├── manifests/              # Per-paper JSON manifests (resume + audit trail)
 ├── input/
