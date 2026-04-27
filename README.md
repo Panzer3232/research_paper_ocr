@@ -291,7 +291,7 @@ Every call to `ocr()` returns a `list[OCRPipelineResult]`, one item per PDF.
 
 ## Structured JSON format
 
-When `--export-json` is used, each PDF produces a `.json` file under `data_ocr/structured_json/`. The file groups MinerU's flat block list into logical sections for RAG pipelines.
+When `--export-json` is used, each PDF produces a `.json` file under `data_ocr/structured_json/`. The file groups MinerU's flat block list into logical sections preserving inherent research paper structure.
 
 ```json
 {
