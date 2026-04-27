@@ -1,11 +1,45 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from app.config.models import PipelineConfig
 from app.core.exceptions import ConfigurationError
+
+
+def _load_dotenv(env_path: Path) -> dict[str, str]:
+    
+    result: dict[str, str] = {}
+    if not env_path.exists():
+        return result
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            result[key] = value
+
+    return result
+
+
+def _apply_env_to_apis(apis: dict[str, Any], env: dict[str, str]) -> None:
+   
+    mapping = {
+        "OPENAI_API_KEY": "openai_api_key",
+        "OPENAI_BASE_URL": "openai_base_url",
+        "OPENAI_API_VERSION": "openai_api_version",
+        "OPENAI_MODEL": "openai_model",
+    }
+    for env_key, config_key in mapping.items():
+        value = env.get(env_key) or os.environ.get(env_key, "")
+        if value.strip():
+            apis[config_key] = value.strip()
 
 
 def load_config(path: str | Path) -> PipelineConfig:
@@ -25,6 +59,12 @@ def load_config(path: str | Path) -> PipelineConfig:
 
     if not isinstance(payload, dict):
         raise ConfigurationError("Config root must be a JSON/YAML object")
+
+    env_path = config_path.parent / ".env"
+    env = _load_dotenv(env_path)
+    apis = dict(payload.get("apis") or {})
+    _apply_env_to_apis(apis, env)
+    payload["apis"] = apis
 
     try:
         return PipelineConfig.from_dict(payload)

@@ -26,6 +26,9 @@
     "markdown_dir_name": "markdown",
     "captioned_markdown_dir_name": "captioned_markdown"
   },
+  "structured_json": {
+    "enabled": false
+  },
   "logging": {
     "level": "INFO",
     "log_file": null

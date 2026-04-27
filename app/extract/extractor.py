@@ -126,7 +126,7 @@ class MarkdownExtractor:
         reused_existing: bool,
     ) -> ExtractionSummary:
         num_images = len(re.findall(r"!\[[^\]]*\]\([^)]+\)", markdown_text))
-        num_tables = len(re.findall(r"(?m)^\|.+\|\s*\n\|[-:| ]+\|", markdown_text))
+        num_tables = len(re.findall(r"(?m)^\|.+\|$", markdown_text))
         num_equations = markdown_text.count("$$") // 2
         num_headings = len(re.findall(r"(?m)^#{1,6}\s+", markdown_text))
 

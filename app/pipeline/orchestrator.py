@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from app.config.models import PipelineConfig
@@ -13,13 +15,15 @@ from app.models.manifest import PipelineManifest
 from app.models.paper import PaperRecord
 from app.pipeline.input_resolver import OCRJob
 from app.state.manifest_store import ManifestStore
-from app.state.status import StageStatus
+from app.state.status import BatchStatus, StageStatus
 from app.storage.paths import PathResolver
+from app.storage.writers import write_json
 
 
 @dataclass(slots=True)
 class OCRResult:
     
+
     paper_key: str
     label: str
     pdf_path: str
@@ -27,6 +31,7 @@ class OCRResult:
     status: str
     markdown_path: str | None = None
     captioned_path: str | None = None
+    structured_json_path: str | None = None
     manifest_path: str | None = None
     extraction_stats: dict[str, Any] = field(default_factory=dict)
     captioning_stats: dict[str, Any] = field(default_factory=dict)
@@ -41,6 +46,7 @@ class OCRResult:
             "status": self.status,
             "markdown_path": self.markdown_path,
             "captioned_path": self.captioned_path,
+            "structured_json_path": self.structured_json_path,
             "manifest_path": self.manifest_path,
             "extraction_stats": self.extraction_stats,
             "captioning_stats": self.captioning_stats,
@@ -50,7 +56,6 @@ class OCRResult:
 
 class OCROrchestrator:
     
-
     def __init__(
         self,
         config: PipelineConfig,
@@ -73,7 +78,19 @@ class OCROrchestrator:
         self.captioner = captioner
 
     def run(self, jobs: list[OCRJob]) -> list[OCRResult]:
-       
+        """
+        Process a list of OCR jobs sequentially.
+
+        Parameters
+        ----------
+        jobs:
+            List produced by :func:`~app.pipeline.input_resolver.resolve_ocr_inputs`.
+
+        Returns
+        -------
+        list[OCRResult]
+            One result per input job, in the same order.
+        """
         total = len(jobs)
         results: list[OCRResult] = []
 
@@ -96,6 +113,7 @@ class OCROrchestrator:
 
         return results
 
+   
     def _process(self, job: OCRJob, *, index: int, total: int) -> OCRResult:
         paper = self._paper_from_job(job)
         manifest = self._prepare_manifest(paper, job)
@@ -123,6 +141,7 @@ class OCROrchestrator:
                 message="captioning disabled or not configured",
             )
             self.manifest_store.mark_completed(manifest)
+            structured_json_path = self._export_structured_json(paper, extract_result, captioned_markdown_path=None)
             self._log(index, total, job.label, f"completed | markdown={markdown_path}")
 
             return OCRResult(
@@ -132,6 +151,7 @@ class OCROrchestrator:
                 success=True,
                 status="completed",
                 markdown_path=markdown_path,
+                structured_json_path=structured_json_path,
                 manifest_path=str(self.manifest_store.path_for(job.paper_key)),
                 extraction_stats=extract_result,
             )
@@ -153,6 +173,7 @@ class OCROrchestrator:
 
         captioned_path = self._resolve_captioned_path(caption_result, manifest)
         self.manifest_store.mark_completed(manifest)
+        structured_json_path = self._export_structured_json(paper, extract_result, captioned_markdown_path=captioned_path)
         self._log(index, total, job.label, f"completed | captioned={captioned_path}")
 
         return OCRResult(
@@ -163,6 +184,7 @@ class OCROrchestrator:
             status="completed",
             markdown_path=markdown_path,
             captioned_path=captioned_path,
+            structured_json_path=structured_json_path,
             manifest_path=str(self.manifest_store.path_for(job.paper_key)),
             extraction_stats=extract_result,
             captioning_stats=caption_result,
@@ -319,6 +341,51 @@ class OCROrchestrator:
         if isinstance(value, str) and value:
             return value
         return manifest.output_paths.get("captioned_markdown")
+
+    def _export_structured_json(
+        self,
+        paper: PaperRecord,
+        extract_result: dict[str, Any],
+        *,
+        captioned_markdown_path: str | None,
+    ) -> str | None:
+        if not self.config.structured_json.enabled:
+            return None
+
+        content_list_path = extract_result.get("content_list_path")
+        if not content_list_path or not Path(content_list_path).exists():
+            self.logger.warning(
+                "%s | content_list.json not found — structured JSON export skipped",
+                paper.paper_key,
+            )
+            return None
+
+        output_path = self.paths.structured_json_path(paper.paper_key)
+        if output_path.exists():
+            self.logger.debug(
+                "%s | structured JSON already exists, reusing", paper.paper_key
+            )
+            return str(output_path)
+
+        from app.extract.json_structurer import build_structured_json
+
+        source_pdf = Path(paper.local_pdf_path).stem if paper.local_pdf_path else paper.paper_key
+
+        structured = build_structured_json(
+            content_list_path,
+            paper_key=paper.paper_key,
+            source_pdf=source_pdf,
+            captioned_markdown_path=captioned_markdown_path,
+        )
+        write_json(output_path, structured)
+        self.logger.info(
+            "%s | structured JSON written: %d sections | llm_captioned=%s | %s",
+            paper.paper_key,
+            structured["metadata"]["total_sections"],
+            structured["metadata"]["llm_captioned"],
+            output_path,
+        )
+        return str(output_path)
 
     def _log(
         self, index: int, total: int, label: str, message: str, *, level: str = "info"

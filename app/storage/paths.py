@@ -23,7 +23,11 @@ class PathResolver:
 
     @property
     def root_dir(self) -> Path:
-        return Path(self.output.root_dir).resolve()
+        return Path(self.output.root_dir)
+
+    @property
+    def input_dir(self) -> Path:
+        return self.root_dir / self.output.input_dir_name
 
     @property
     def manifests_dir(self) -> Path:
@@ -41,13 +45,24 @@ class PathResolver:
     def captioned_markdown_dir(self) -> Path:
         return self.root_dir / self.output.captioned_markdown_dir_name
 
+    @property
+    def structured_json_dir(self) -> Path:
+        return self.root_dir / self.output.structured_json_dir_name
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.root_dir / self.output.reports_dir_name
+
     def ensure_base_dirs(self) -> None:
         for path in (
             self.root_dir,
+            self.input_dir,
             self.manifests_dir,
             self.mineru_raw_dir,
             self.markdown_dir,
             self.captioned_markdown_dir,
+            self.structured_json_dir,
+            self.reports_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -67,3 +82,9 @@ class PathResolver:
     def captioned_markdown_path(self, paper_key: str, extension: str = ".md") -> Path:
         ext = extension if extension.startswith(".") else f".{extension}"
         return self.captioned_markdown_dir / f"{self.normalized_key(paper_key)}{ext}"
+
+    def structured_json_path(self, paper_key: str) -> Path:
+        return self.structured_json_dir / f"{self.normalized_key(paper_key)}.json"
+
+    def report_path(self, filename: str) -> Path:
+        return self.reports_dir / sanitize_path_component(filename, max_length=220)

@@ -23,7 +23,7 @@ _BUNDLED_CONFIG = Path(__file__).parent / "config.json"
 
 
 def enable_logging(level: str = "INFO", log_file: str | None = None) -> None:
-   
+    
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file:
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -40,7 +40,6 @@ def enable_logging(level: str = "INFO", log_file: str | None = None) -> None:
         lg.propagate = False
 
 
-
 @dataclass(frozen=True)
 class OCRPipelineResult:
     
@@ -49,16 +48,14 @@ class OCRPipelineResult:
     success: bool
     markdown_path: str | None
     captioned_path: str | None
+    structured_json_path: str | None
     error: str | None
     status: str
     label: str
 
     def effective_markdown(self) -> str | None:
-        """
-        Return the best available markdown path for this result.
-        """
+        
         return self.captioned_path or self.markdown_path
-
 
 
 def _load_dotenv() -> None:
@@ -129,26 +126,32 @@ def _to_public_result(r: OCRResult) -> OCRPipelineResult:
         success=r.success,
         markdown_path=r.markdown_path,
         captioned_path=r.captioned_path,
+        structured_json_path=r.structured_json_path,
         error=r.error,
         status=r.status,
         label=r.label,
     )
 
+
 def ocr(
     input_path: str | Path,
     *,
     caption: bool = False,
+    export_json: bool = False,
     config: PipelineConfig | None = None,
     config_path: str | Path | None = None,
     output_dir: str | Path | None = None,
 ) -> list[OCRPipelineResult]:
-    
+
     _load_dotenv()
 
     config_obj = _resolve_config(config, config_path, output_dir)
 
     if caption:
         config_obj.captioning.enabled = True
+
+    if export_json:
+        config_obj.structured_json.enabled = True
 
     validate_config(config_obj)
 
