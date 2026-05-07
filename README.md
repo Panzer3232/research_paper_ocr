@@ -14,6 +14,7 @@ A pipeline for extracting structured Markdown and RAG-ready JSON from research p
 4. Optionally exports a structured  `.json` file per paper, grouped by section with page metadata. If captioning is also enabled, GPT-generated captions are embedded into image blocks as `caption_llm`.
 5. Saves all outputs under `data_ocr/` with a structured layout.
 6. Writes a per-paper JSON manifest for resume support — interrupted runs pick up from where they stopped.
+7. Exposes a FastAPI backend for submitting multiple independent batch jobs simultaneously on a shared GPU server.
 
 ---
 
@@ -291,7 +292,23 @@ Every call to `ocr()` returns a `list[OCRPipelineResult]`, one item per PDF.
 
 ## Structured JSON format
 
-When `--export-json` is used, each PDF produces a `.json` file under `data_ocr/structured_json/`. The file groups MinerU's flat block list into logical sections preserving inherent research paper structure.
+When `--export-json` is used, each PDF produces a `.json` file under `data_ocr/structured_json/`. It is built from MinerU's native `content_list.json` — no custom Markdown parsing is needed for the primary content. The structurer groups MinerU's flat block list into logical sections based on heading blocks, then enriches image blocks with captions from both MinerU and GPT.
+
+### How sections are built
+ 
+A new section opens whenever MinerU emits a `text` block with a `text_level` field (a heading). All content blocks that follow are accumulated into that section until the next heading. Content that appears before the first heading is placed into a `[Preamble]` section at level 0. `discarded` blocks from MinerU are dropped entirely.
+ 
+### How captions are resolved
+ 
+**Images** — caption resolved from `image_caption` or `image_footnote` fields in the MinerU block. If captioning was enabled, `caption_llm` is added from the GPT alt-text written into the captioned markdown file.
+ 
+**Tables** — caption resolved in priority order: `table_caption` field → `table_footnote` field → immediately preceding text block matching `"Table N: ..."` pattern (lookbehind) → immediately following text block matching the same pattern (lookahead). The consumed caption text block is removed from the section body so it does not appear twice.
+ 
+**Equations** — emitted with `text` (LaTeX string if available), optional `text_format` (e.g. `"latex"`), and optional `img_path` (rendered fallback image from MinerU).
+ 
+### Missing image recovery
+ 
+MinerU occasionally omits image blocks from `content_list.json` while still writing the image tags into the markdown. The structurer detects this by parsing the captioned markdown (or plain markdown if captioning is disabled), matching images by section heading, and injecting any missing image blocks into the correct section. This ensures no figures are silently lost from the JSON output.
 
 ```json
 {
@@ -363,4 +380,105 @@ The pipeline writes a JSON manifest per PDF under `data_ocr/manifests/`. If a ru
 - Only the failed or incomplete stage is retried.
 - Set `resume.enabled: false` in `config.json` to force a full re-run.
 
+---
+
+## FastAPI Backend
+
+The FastAPI backend allows multiple independent batch jobs to run simultaneously on a shared GPU server. Each job runs as a completely separate OS process with its own Python interpreter, memory, and MinerU instance. The server manages process count — GPU scheduling is left entirely to the server.
+ 
+### Additional requirements
+
+If installed through requirements.txt then okay otherwise install these.
+
+```bash
+pip install fastapi "uvicorn[standard]"
+```
+ 
+### Start the server
+ 
+```bash
+MAX_CONCURRENT_PROCESSES=2 uvicorn api:app --host 0.0.0.0 --port 8002
+```
+ 
+With captioning credentials:
+ 
+```bash
+OPENAI_API_KEY=your_key \
+OPENAI_BASE_URL=https://your-resource.openai.azure.com/ \
+MAX_CONCURRENT_PROCESSES=2 \
+uvicorn api:app --host 0.0.0.0 --port 8002
+```
+ 
+`MAX_CONCURRENT_PROCESSES` controls how many jobs run simultaneously. Default is `2`. Each job runs MinerU papers sequentially within its own process, so at most `N` MinerU instances run on the GPU at any given time.
+ 
+### Endpoints
+ 
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Active process count and capacity status |
+| `POST` | `/jobs` | Submit a new batch job |
+| `GET` | `/jobs/{job_id}` | Poll status of a specific job |
+| `GET` | `/jobs` | List all jobs in the current session |
+| `PATCH` | `/config` | Update `max_concurrent_processes` at runtime |
+ 
+### Submit a job
+ 
+```bash
+# Extraction only
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/"}'
+ 
+# With captioning and JSON export
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/", "caption": true, "export_json": true}'
+ 
+# With per-job hyperparameter overrides (config.json is never modified)
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input_path": "/absolute/path/to/pdfs/",
+    "caption": true,
+    "export_json": true,
+    "overrides": {
+      "captioning.timeout_seconds": 300,
+      "captioning.max_retries": 3
+    }
+  }'
+```
+ 
+### Poll status
+ 
+```bash
+curl http://localhost:8002/jobs/{job_id}
+curl http://localhost:8002/jobs
+curl http://localhost:8002/health
+```
+ 
+### Checking job results and conversion counts
+ 
+After a job completes, always check `data_ocr/job_results/{job_id}.json` for the full per-paper breakdown. This file is written by the worker process on completion and contains succeeded/failed counts, output paths, and error messages for every PDF in the batch. Key fields to check: The `total`, `succeeded`, and `failed` fields immediately tell you how many PDFs were converted. Individual `error` fields show what went wrong for any failed paper.
+ 
+### Duplicate PDFs across concurrent jobs
+ 
+> **Important:** If the same PDF filename exists in two different folders submitted as separate concurrent jobs, both processes will process it independently because the `paper_key` is derived from the full resolved path — different folders produce different keys.
+ 
+To avoid redundant processing and GPU contention, **do not include the same PDF filename in two folders submitted simultaneously**. Each folder submitted to a concurrent job should contain a unique set of PDFs. The `fcntl` lock in `mineru_runner.py` serializes MinerU runs on the same filename stem across processes (preventing GPU crash), but it does not skip the second job's processing entirely — it will still run MinerU and produce a separate output under a different `paper_key`.
+ 
+If a paper is accidentally processed twice, its two outputs will have different `paper_key` hashes and both will exist on disk. To clean up, identify the duplicate manifests:
+
+Keep the one from the intended run and delete the other along with its corresponding output files.
+ 
+### Recovering failed papers
+ 
+If a paper fails due to GPU interruption, its manifest records the failure and resume logic will skip it on resubmission. To force a retry, delete its manifest first:
+ 
+```bash
+ls data_ocr/manifests/ | grep "paper_filename_stem"
+rm data_ocr/manifests/{paper_key}.json
+```
+ 
+Then resubmit the job.
+ 
 ---

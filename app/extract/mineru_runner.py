@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 
 from app.config.models import MinerUConfig
 from app.core.exceptions import ExtractionError
+
+logger = logging.getLogger(__name__)
+
+_LOCKS_DIR_NAME = ".mineru_locks"
+
+
+def _lock_path(pdf_path: Path) -> Path:
+    digest = hashlib.sha1(str(pdf_path).encode("utf-8")).hexdigest()
+    locks_dir = pdf_path.parent / _LOCKS_DIR_NAME
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    return locks_dir / f"{digest}.lock"
 
 
 @dataclass(slots=True)
@@ -55,11 +70,68 @@ class MinerURunner:
 
         output_root.mkdir(parents=True, exist_ok=True)
 
+        
         existing = self._find_existing_result(pdf_path, output_root)
         if existing is not None and skip_if_markdown_exists:
             existing.reused_existing = True
             return existing
 
+       
+        lock_file = _lock_path(pdf_path)
+        lock_fd = open(lock_file, "w")
+        try:
+            logger.debug("Acquiring MinerU lock for %s", pdf_path.name)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            logger.debug("Lock acquired for %s", pdf_path.name)
+
+            # Re-check after acquiring lock — another process may have
+            # completed extraction into this same output_root while we waited.
+            existing = self._find_existing_result(pdf_path, output_root)
+            if existing is not None and skip_if_markdown_exists:
+                existing.reused_existing = True
+                return existing
+
+            # Detect and clean up a stale output_root — one that exists but
+            # contains no markdown. This happens when a previous MinerU run
+            # was killed mid-execution (GPU OOM, process kill, power loss).
+            # Leaving a stale directory causes _locate_result to find nothing
+            # and raise ExtractionError even though MinerU would succeed if
+            # given a clean directory.
+            if self._is_stale_output(pdf_path, output_root):
+                logger.warning(
+                    "Stale MinerU output detected for %s at %s — cleaning up and retrying.",
+                    pdf_path.name,
+                    output_root,
+                )
+                self._cleanup_stale_output(output_root)
+                output_root.mkdir(parents=True, exist_ok=True)
+
+            result = self._run_mineru(pdf_path, output_root)
+            return result
+
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _is_stale_output(self, pdf_path: Path, output_root: Path) -> bool:
+        if not output_root.exists():
+            return False
+        existing = self._locate_result(pdf_path, output_root)
+        has_any_files = any(output_root.rglob("*"))
+        return has_any_files and existing is None
+
+    def _cleanup_stale_output(self, output_root: Path) -> None:
+        for child in output_root.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+
+    def _run_mineru(
+        self,
+        pdf_path: Path,
+        output_root: Path,
+    ) -> MinerURunResult:
         command = [
             self.config.command,
             "-p",
@@ -84,7 +156,9 @@ class MinerURunner:
                 f"MinerU command not found: {self.config.command}"
             ) from exc
         except Exception as exc:
-            raise ExtractionError(f"Failed to execute MinerU for {pdf_path}") from exc
+            raise ExtractionError(
+                f"Failed to execute MinerU for {pdf_path}"
+            ) from exc
 
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()

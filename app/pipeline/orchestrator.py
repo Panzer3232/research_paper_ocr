@@ -361,11 +361,6 @@ class OCROrchestrator:
             return None
 
         output_path = self.paths.structured_json_path(paper.paper_key)
-        if output_path.exists():
-            self.logger.debug(
-                "%s | structured JSON already exists, reusing", paper.paper_key
-            )
-            return str(output_path)
 
         from app.extract.json_structurer import build_structured_json
 

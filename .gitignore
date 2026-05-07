@@ -6,6 +6,8 @@ test_ocr.py
 
 # Pipeline output 
 data_ocr/
+test_pdfs/
+RAG/
 
 # Python
 __pycache__/
