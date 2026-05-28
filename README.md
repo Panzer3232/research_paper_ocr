@@ -23,6 +23,7 @@ A pipeline for extracting structured Markdown and RAG-ready JSON from research p
 
 - Python 3.10 or later
 - MinerU system dependencies (CUDA recommended for GPU acceleration — see [MinerU installation guide](https://github.com/opendatalab/MinerU))
+- `chonkie>=1.1.0` for RAG chunking.
 
 ---
 
