@@ -50,7 +50,7 @@ class ResumeConfig:
 
 @dataclass(slots=True)
 class OutputConfig:
-    root_dir: str = "data"
+    root_dir: str = "data_ocr"
     input_dir_name: str = "input"
     manifests_dir_name: str = "manifests"
     mineru_raw_dir_name: str = "mineru_raw"

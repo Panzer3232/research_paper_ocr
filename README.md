@@ -15,6 +15,7 @@ A pipeline for extracting structured Markdown and RAG-ready JSON from research p
 5. Saves all outputs under `data_ocr/` with a structured layout.
 6. Writes a per-paper JSON manifest for resume support — interrupted runs pick up from where they stopped.
 7. Exposes a FastAPI backend for submitting multiple independent batch jobs simultaneously on a shared GPU server.
+8. Provides chunks for vector db specially designed for research paper.
 
 ---
 
@@ -482,3 +483,226 @@ rm data_ocr/manifests/{paper_key}.json
 Then resubmit the job.
  
 ---
+
+## RAG Chunking Pipeline
+
+The RAG chunking pipeline converts the structured JSON produced by the OCR stage into retrieval-ready chunks. It runs as a separate, independent stage after OCR completes. Each chunk is self-contained and carries full provenance metadata, making it suitable for direct ingestion into any vector store.
+
+The pipeline has three sequential steps: **prepare** (normalize and filter), **chunk** (split by content type), and **evaluate** (optional quality audit).
+
+---
+
+### Output structure
+
+When chunking runs, all output is written under `data_ocr/rag_chunks/`:
+
+```
+data_ocr/
+└── rag_chunks/
+    ├── normalized/          # Filtered, normalized JSON — one file per paper
+    │   └── _prepare_report.json
+    ├── chunks/              # Final chunk JSON — one file per paper
+    │   └── _chunk_report.json
+    ├── evaluation/          # Per-paper quality reports (only when evaluate=True)
+    │   └── _evaluation_report.json
+    └── logs/
+        ├── 01_prepare.log
+        ├── 02_chunk.log
+        └── 03_evaluate.log  # Only when evaluate=True
+```
+
+---
+
+### Chunk types
+
+The pipeline treats prose, equations, tables, and figures as structurally distinct and applies separate assembly logic to each. They are never mixed within a single chunk.
+
+**Prose** — consecutive text blocks within a section are joined and split by a recursive character splitter (Chonkie `RecursiveChunker` with `OverlapRefinery` if available, deterministic paragraph-based fallback otherwise). Short prose fragments below `min_prose_tokens` are merged with an adjacent prose chunk in the same section rather than emitted as standalone noise.
+
+**Equation** — each equation becomes its own chunk. The chunk text includes the raw LaTeX string, the section path for context, and up to `max_context_blocks` surrounding prose blocks on each side. The surrounding prose is included because equations without any textual context are retrievable in name only — the context explains what the equation computes and why. Quality flags distinguish between equations with full bilateral context, one-sided context, and no context at all.
+
+**Table** — each table becomes one or more chunks depending on size. If the rendered HTML exceeds `table_chunk_size` tokens, the table is split row-wise with the caption and header row repeated in every part so each chunk is self-contained. Caption recovery searches the `table_caption` field, then `table_footnote`, then nearby text blocks matching a `"Table N: ..."` pattern in both directions. Nearby in-text table references are included in the chunk text.
+
+**Figure** — consecutive image blocks in the same section are grouped into a single figure chunk. Caption recovery follows the same multi-source strategy as tables. If GPT captioning was enabled during OCR, the `caption_llm` field from each image block is included in the chunk text as an image summary, giving the vector store a natural-language description of visual content that would otherwise be unretrievable.
+
+---
+
+### Metadata and chunk IDs
+
+Every chunk carries a deterministic `chunk_id` of the form `{paper_key}_{ordinal:05d}_{chunk_type}` — stable across re-runs on the same input, which means re-indexing a corrected paper does not produce phantom duplicates in a vector store that deduplicates by ID.
+
+Each chunk's metadata includes:
+
+- `paper_key`, `source_pdf`, `paper_title`, `venue`, `venue_year`, `authors_raw` — paper-level provenance for filtered retrieval without a separate metadata lookup.
+- `section_path` — full hierarchy from root to the containing section, e.g. `["3 Methodology", "3.2 Training Objective"]`. Enables section-scoped retrieval and reranking by position in the paper.
+- `page_span` — `{start, end}` page indices of the source blocks, useful for returning page-anchored citations.
+- `source_block_ids` and `source_block_indices` — trace every chunk back to the exact MinerU blocks it was assembled from.
+- `relations` — explicit links to the previous and next chunks globally, previous and next chunks within the same section, and cross-type block references (e.g. which text blocks surround an equation, which text blocks reference a table). These relations allow a retrieval system to fetch neighboring context at query time without re-embedding.
+- `quality_flags` — a list of string tags written during chunking that describe structural anomalies (e.g. `equation_one_sided_context`, `table_caption_inferred`, `figure_without_llm_caption`, `short_prose_merged_with_next`). These are non-blocking — the chunk is still emitted — but they are surfaced in the evaluation report so problematic chunks can be identified and filtered downstream.
+
+---
+
+### Hyperparameters
+
+All hyperparameters are set under the `rag_chunking` key in `config.json` and apply to every paper in the run. They can be tuned without touching any code.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `chunk_size` | `640` | Target token size for prose chunks. Prose is split at paragraph boundaries up to this limit. |
+| `overlap` | `64` | Token overlap between adjacent prose chunks from the same block group, implemented via Chonkie `OverlapRefinery`. |
+| `table_chunk_size` | `768` | Token threshold above which a table is split row-wise. Tables at or below this size are emitted as a single chunk. |
+| `min_prose_tokens` | `80` | Prose chunks below this size are merged with an adjacent same-section chunk rather than emitted standalone. |
+| `max_context_blocks` | `2` | Maximum number of surrounding prose blocks included in each equation chunk on each side. |
+| `split_long_tables` | `true` | When `false`, oversized tables are emitted as a single chunk regardless of size. Set to `false` only if your vector store has a hard token limit that exceeds `table_chunk_size`. |
+
+```json
+"rag_chunking": {
+  "structured_json_input_dir": null,
+  "chunk_size": 640,
+  "overlap": 64,
+  "table_chunk_size": 768,
+  "min_prose_tokens": 80,
+  "max_context_blocks": 1,
+  "split_long_tables": true
+}
+```
+
+Set `structured_json_input_dir` to a path if you want `chunk()` to resolve the input directory from config rather than passing it as an argument.
+
+---
+
+### Quality evaluation
+
+When `evaluate=True`, the pipeline runs a structural audit on every chunk file after chunking completes. Each paper receives an `overall_status` of `PASS`, `WARN`, or `FAIL`.
+
+**FAIL conditions** (hard problems that indicate data loss or structural corruption): empty chunks, missing `section_path`, missing `source_block_ids`, missing `relations`, reference section leaks into chunk content, checklist text leaks, equations with no LaTeX string, equations with no surrounding context at all.
+
+**WARN conditions** (soft problems worth reviewing but not blocking): duplicate chunk text, prose chunks below `min_prose_tokens`, prose chunks exceeding `chunk_size` by more than 15%, prose that does not read as natural sentences, tables with inferred or missing captions, figures without a GPT caption when captioning was expected.
+
+The aggregate evaluation report at `rag_chunks/evaluation/_evaluation_report.json` contains status counts across all papers and per-paper breakdowns with example chunk IDs for every flagged condition.
+
+---
+
+### Running chunking via Python
+
+Chunking is exposed through `chunk()` in `ocr.py`. It is fully independent of `ocr()` — call it on any folder of structured JSON files, whether produced by this pipeline or another source.
+
+```python
+from ocr import ocr, chunk
+
+# Step 1: OCR — export_json=True is required for chunking to have input
+ocr_results = ocr("/path/to/pdfs/", export_json=True)
+
+# Step 2: chunk — reads from the structured_json directory produced above
+chunk_results = chunk(structured_json_dir="data_ocr/structured_json/")
+
+for r in chunk_results:
+    if r.success:
+        print(r.paper_key, "→", r.chunk_json_path)
+    else:
+        print(r.paper_key, "FAILED:", r.error)
+```
+
+With evaluation and a custom output directory:
+
+```python
+chunk_results = chunk(
+    structured_json_dir="data_ocr/structured_json/",
+    evaluate=True,
+    output_dir="/absolute/path/to/output/",
+)
+```
+
+With a custom `ChunkConfig`:
+
+```python
+from ocr import chunk
+from rag_chunking.common import ChunkConfig
+
+chunk_results = chunk(
+    structured_json_dir="data_ocr/structured_json/",
+    chunk_config=ChunkConfig(chunk_size=512, overlap=32, min_prose_tokens=60),
+)
+```
+
+Input path can also be set in `config.json` under `rag_chunking.structured_json_input_dir` and omitted from the call entirely:
+
+```python
+chunk_results = chunk(config_path="/path/to/config.json")
+```
+
+`chunk()` raises `ValueError` with a descriptive message if no input path is resolvable from either source.
+
+#### `RAGChunkResult` reference
+
+Every call to `chunk()` returns a `list[RAGChunkResult]`, one item per JSON file.
+
+| Field | Type | Description |
+|---|---|---|
+| `paper_key` | `str` | Filename stem of the source JSON |
+| `source_json_path` | `str` | Absolute path to the input structured JSON |
+| `success` | `bool` | `True` when all enabled stages completed without error |
+| `normalized_json_path` | `str \| None` | Prepare step output. `None` if prepare failed |
+| `chunk_json_path` | `str \| None` | Chunk step output. `None` if chunk failed or was not reached |
+| `evaluation_report_path` | `str \| None` | Evaluation output. `None` if `evaluate=False` or a prior stage failed |
+| `error` | `str \| None` | Error message when `success=False`, otherwise `None` |
+| `status` | `str` | `"completed"`, `"failed_prepare"`, `"failed_chunk"`, or `"failed_evaluate"` |
+
+---
+
+### Running chunking via the FastAPI backend
+
+The API accepts `chunk` and `evaluate` as independent boolean fields alongside the existing OCR fields. All flags default to `False`.
+
+```bash
+# OCR only — existing behaviour, unchanged
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/"}'
+
+# OCR + caption (independent of chunking)
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/", "caption": true}'
+
+# OCR + chunking (export_json is forced true internally)
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/", "chunk": true}'
+
+# OCR + caption + chunking + evaluation
+curl -X POST http://localhost:8002/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/", "caption": true, "chunk": true, "evaluate": true}'
+```
+
+`caption` and `chunk` are independent flags. Setting `caption=true` without `chunk=true` runs GPT captioning and stops — no chunking occurs. Setting `chunk=true` without `caption=true` runs OCR and chunking without captioning. Setting both runs all stages sequentially in a single process, and figure chunks will contain GPT image summaries (`caption_llm`) in their text.
+
+`evaluate` has no effect when `chunk=false`.
+
+The job result file at `data_ocr/job_results/{job_id}.json` contains a top-level `chunking` key alongside the existing OCR `results` key:
+
+```json
+{
+  "succeeded": 3,
+  "failed": 0,
+  "results": [ ... ],
+  "chunking": {
+    "ran": true,
+    "succeeded": 3,
+    "failed": 0,
+    "results": [
+      {
+        "paper_key": "...",
+        "success": true,
+        "status": "completed",
+        "normalized_json_path": "...",
+        "chunk_json_path": "...",
+        "evaluation_report_path": null
+      }
+    ]
+  }
+}
+```
+
+When `chunk=false`, `chunking` is `{"ran": false}` — present but clearly skipped. Existing consumers of the result file that do not inspect the `chunking` key are unaffected.

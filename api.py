@@ -5,17 +5,16 @@ import multiprocessing
 import threading
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from api_config import APIConfig
-
 
 
 @dataclass
@@ -25,6 +24,8 @@ class JobEntry:
     output_dir: str | None
     caption: bool
     export_json: bool
+    chunk: bool
+    evaluate: bool
     config_overrides: dict
     submitted_at: str
     process: multiprocessing.Process
@@ -32,7 +33,6 @@ class JobEntry:
     status: str = "running"
     finished_at: str | None = None
     result: dict | None = None
-
 
 
 class AppState:
@@ -64,7 +64,7 @@ class AppState:
     def refresh_status(self, entry: JobEntry) -> None:
         """
         Sync the entry's status from the child process state and result file.
-        Mutates entry in-place. Must be called under no lock since it does I/O.
+        Mutates entry in-place. Must be called outside the lock since it does I/O.
         """
         if entry.status != "running":
             return
@@ -104,12 +104,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-
 app = FastAPI(
     title="research_paper_ocr API",
     version="1.0.0",
     description=(
-        "Submit OCR pipeline jobs for research paper PDFs. "
+        "Submit OCR and RAG chunking pipeline jobs for research paper PDFs. "
         "Each job runs as an independent OS process. "
         "If the server is at capacity, resubmit when GPU is free."
     ),
@@ -123,12 +122,13 @@ def _state() -> AppState:
     return _app_state
 
 
-
 class JobSubmitRequest(BaseModel):
     input_path: str = Field(..., description="Absolute path to a PDF file or directory of PDFs.")
     output_dir: str | None = Field(None, description="Override output root directory for this job.")
-    caption: bool = Field(False, description="Enable GPT image captioning.")
-    export_json: bool = Field(False, description="Export structured RAG-ready JSON.")
+    caption: bool = Field(False, description="Enable GPT image captioning during OCR.")
+    export_json: bool = Field(False, description="Export structured RAG-ready JSON after OCR.")
+    chunk: bool = Field(False, description="Run RAG chunking pipeline after OCR. Forces export_json=True internally.")
+    evaluate: bool = Field(False, description="Run chunk quality evaluation after chunking. Has no effect when chunk=False.")
     overrides: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -143,7 +143,6 @@ class CapacityPatchRequest(BaseModel):
     max_concurrent_processes: int = Field(..., ge=1, le=32)
 
 
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -156,6 +155,8 @@ def _entry_to_dict(entry: JobEntry) -> dict:
         "output_dir": entry.output_dir,
         "caption": entry.caption,
         "export_json": entry.export_json,
+        "chunk": entry.chunk,
+        "evaluate": entry.evaluate,
         "config_overrides": entry.config_overrides,
         "submitted_at": entry.submitted_at,
         "finished_at": entry.finished_at,
@@ -214,7 +215,17 @@ def submit_job(body: JobSubmitRequest):
 
     process = multiprocessing.Process(
         target=_worker_target,
-        args=(job_id, str(body.input_path), result_path, body.caption, body.export_json, output_dir, overrides),
+        args=(
+            job_id,
+            str(body.input_path),
+            result_path,
+            body.caption,
+            body.export_json,
+            body.chunk,
+            body.evaluate,
+            output_dir,
+            overrides,
+        ),
         name=f"ocr-job-{job_id[:8]}",
         daemon=True,
     )
@@ -226,6 +237,8 @@ def submit_job(body: JobSubmitRequest):
         output_dir=output_dir,
         caption=body.caption,
         export_json=body.export_json,
+        chunk=body.chunk,
+        evaluate=body.evaluate,
         config_overrides=body.overrides,
         submitted_at=_utc_now(),
         process=process,
@@ -256,13 +269,12 @@ def get_job(job_id: str):
 @app.get("/jobs", tags=["jobs"])
 def list_jobs():
     state = _state()
-    jobs = state.all_jobs()
 
     for entry in list(state._jobs.values()):
         state.refresh_status(entry)
 
     return {
-        "total": len(jobs),
+        "total": len(state._jobs),
         "active": state.active_count(),
         "max_concurrent_processes": state.max_concurrent,
         "jobs": state.all_jobs(),
@@ -285,13 +297,14 @@ def update_capacity(body: CapacityPatchRequest):
     }
 
 
-
 def _worker_target(
     job_id: str,
     input_path: str,
     result_path: str,
     caption: bool,
     export_json: bool,
+    chunk: bool,
+    evaluate: bool,
     output_dir: str | None,
     config_overrides: dict,
 ) -> None:
@@ -302,6 +315,8 @@ def _worker_target(
         result_path=result_path,
         caption=caption,
         export_json=export_json,
+        chunk=chunk,
+        evaluate=evaluate,
         output_dir=output_dir,
         config_overrides=config_overrides,
     )

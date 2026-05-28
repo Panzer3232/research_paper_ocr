@@ -32,5 +32,14 @@
   "logging": {
     "level": "INFO",
     "log_file": null
+  },
+  "rag_chunking": {
+    "structured_json_input_dir": null,
+    "chunk_size": 640,
+    "overlap": 64,
+    "table_chunk_size": 768,
+    "min_prose_tokens": 80,
+    "max_context_blocks": 1,
+    "split_long_tables": true
   }
 }
