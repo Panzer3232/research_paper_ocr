@@ -412,7 +412,37 @@ uvicorn api:app --host 0.0.0.0 --port 8002
 ```
  
 `MAX_CONCURRENT_PROCESSES` controls how many jobs run simultaneously. Default is `2`. Each job runs MinerU papers sequentially within its own process, so at most `N` MinerU instances run on the GPU at any given time.
- 
+
+### Synchronous vs asynchronous mode
+
+`POST /jobs` supports two execution modes controlled by the `wait` field.
+
+**Asynchronous (default, `wait=false`):** The server returns HTTP 202 immediately with a `job_id`. The job runs in the background. Poll `GET /jobs/{job_id}` until `status` is `succeeded` or `failed`. Use this for large batches or when captioning is enabled.
+
+**Synchronous (`wait=true`):** The HTTP request blocks until the pipeline finishes and returns the full result directly (HTTP 200). If the job does not finish within the timeout, the server returns HTTP 504 with the `job_id` — the job is still running and can be polled. Use this when the caller wants a single request/response cycle without polling logic.
+
+```bash
+# Synchronous — blocks until done, returns result directly
+curl -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "/absolute/path/to/pdfs/", "caption": true, "chunk": true, "wait": true}'
+```
+
+**Timeout configuration** is set via env vars at server startup:
+
+| Env var | Default | Description |
+|---|---|---|
+| `MAX_WAIT_TIMEOUT_SECONDS` | `600` | Hard ceiling. Any per-request value above this is silently clamped to it. |
+| `DEFAULT_WAIT_TIMEOUT_SECONDS` | `540` | Used when the caller omits `wait_timeout_seconds` (or passes `-1`). Must not exceed `MAX_WAIT_TIMEOUT_SECONDS`. |
+
+```bash
+MAX_WAIT_TIMEOUT_SECONDS=900 DEFAULT_WAIT_TIMEOUT_SECONDS=750 uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+Per-request override: pass `wait_timeout_seconds` in the request body (any positive integer, clamped to `MAX_WAIT_TIMEOUT_SECONDS`). Pass `-1` or omit it to use the server default.
+
+> **Important:** Your HTTP client's socket timeout must exceed the effective `wait_timeout_seconds` so the server can return a clean 504 before the client drops the connection. Safe rule: `client socket timeout = MAX_WAIT_TIMEOUT_SECONDS + 60s`.
+
 ### Endpoints
  
 | Method | Endpoint | Description |
