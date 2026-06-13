@@ -89,7 +89,7 @@ def run_ocr_job(
         "chunking": {"ran": False},
     }
 
-    # Stage 2: RAG Chunking (optional)
+    # Stage 2: RAG Chunking 
     if chunk:
         if not ocr_succeeded:
             logger.warning(

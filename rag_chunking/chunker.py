@@ -25,7 +25,6 @@ def base_metadata(
         "paper_key": paper_meta.get("paper_key"),
         "source_pdf": paper_meta.get("source_pdf"),
         "paper_title": paper_meta.get("paper_title"),
-        "paper_front_matter": paper_meta.get("front_matter"),
         "chunk_type": chunk_type,
         "section_id": section.get("section_id"),
         "section_index": section.get("section_index"),
@@ -51,6 +50,7 @@ def base_metadata(
             "related_equation_block_ids": [],
             "related_table_block_ids": [],
             "related_figure_block_ids": [],
+            "related_algorithm_block_ids": [],
         },
         "quality_flags": [],
     }
@@ -86,135 +86,29 @@ def chunk_prose_blocks(
     next_ordinal: int,
     min_prose_tokens: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    clean_blocks = [
-        block
-        for block in text_blocks
-        if normalize_text(block.get("text"))
-    ]
-
-    if not clean_blocks:
+    if not text_blocks:
         return [], next_ordinal
 
-    chunk_units: list[dict[str, Any]] = []
-    current_blocks: list[dict[str, Any]] = []
+    text = "\n\n".join(normalize_text(b.get("text")) for b in text_blocks if normalize_text(b.get("text"))).strip()
+    if not text:
+        return [], next_ordinal
 
-    def blocks_text(blocks: list[dict[str, Any]]) -> str:
-        return "\n\n".join(
-            normalize_text(block.get("text"))
-            for block in blocks
-            if normalize_text(block.get("text"))
-        ).strip()
-
-    def emit_current() -> None:
-        nonlocal current_blocks
-        if not current_blocks:
-            return
-
-        text = blocks_text(current_blocks)
-        if text:
-            chunk_units.append(
-                {
-                    "text": text,
-                    "blocks": current_blocks,
-                    "quality_flags": [],
-                }
-            )
-
-        current_blocks = []
-
-    def emit_split_single_block(block: dict[str, Any]) -> None:
-        text = normalize_text(block.get("text"))
-        if not text:
-            return
-
-        raw_parts = splitter.split(text)
-        parts = [normalize_text(part.text) for part in raw_parts if normalize_text(part.text)]
-
-        if not parts:
-            return
-
-        search_start = 0
-        for part_text in parts:
-            start = text.find(part_text, search_start)
-            if start < 0:
-                start = None
-                end = None
-            else:
-                end = start + len(part_text)
-                search_start = end
-
-            chunk_units.append(
-                {
-                    "text": part_text,
-                    "blocks": [block],
-                    "quality_flags": ["single_source_block_split"],
-                    "source_block_char_spans": [
-                        {
-                            "block_id": block.get("block_id"),
-                            "block_index": block.get("block_index"),
-                            "char_start": start,
-                            "char_end": end,
-                            "offset_basis": "normalized_text",
-                        }
-                    ],
-                }
-            )
-
-    for block in clean_blocks:
-        block_text = normalize_text(block.get("text"))
-        block_tokens = estimate_tokens(block_text)
-
-        if block_tokens > splitter.chunk_size_chars // 4:
-            emit_current()
-            emit_split_single_block(block)
-            continue
-
-        candidate_blocks = current_blocks + [block]
-        candidate_text = blocks_text(candidate_blocks)
-
-        if current_blocks and estimate_tokens(candidate_text) > splitter.chunk_size_chars // 4:
-            emit_current()
-
-        current_blocks.append(block)
-
-    emit_current()
-
+    raw_chunks = splitter.split(text)
     chunks: list[dict[str, Any]] = []
-    part_count = len(chunk_units)
-
-    for part_index, unit in enumerate(chunk_units):
-        part_text = unit["text"]
-        blocks = unit["blocks"]
-
+    for part_index, part in enumerate(raw_chunks):
+        part_text = normalize_text(part.text)
+        if not part_text:
+            continue
         next_ordinal += 1
-
         extra = {
             "prose_part_index": part_index,
-            "prose_part_count": part_count,
+            "prose_part_count": len(raw_chunks),
             "splitter_backend": splitter.backend,
         }
-
-        if "source_block_char_spans" in unit:
-            extra["source_block_char_spans"] = unit["source_block_char_spans"]
-
-        chunk = make_chunk(
-            paper_meta,
-            section,
-            blocks,
-            "prose",
-            part_text,
-            next_ordinal,
-            extra,
-        )
-
-        for flag in unit.get("quality_flags", []):
-            chunk["metadata"]["quality_flags"].append(flag)
-
+        chunk = make_chunk(paper_meta, section, text_blocks, "prose", part_text, next_ordinal, extra)
         if estimate_tokens(part_text) < min_prose_tokens:
             chunk["metadata"]["quality_flags"].append("short_prose_candidate")
-
         chunks.append(chunk)
-
     return chunks, next_ordinal
 
 
@@ -267,6 +161,70 @@ def chunk_equation_block(
         chunk["metadata"]["quality_flags"].append("equation_without_text_context")
     elif not before_text or not after_text:
         chunk["metadata"]["quality_flags"].append("equation_one_sided_context")
+
+    return chunk, next_ordinal
+
+
+def chunk_algorithm_block(
+    paper_meta: dict[str, Any],
+    section: dict[str, Any],
+    content: list[dict[str, Any]],
+    algorithm_index: int,
+    next_ordinal: int,
+    config: ChunkConfig,
+) -> tuple[dict[str, Any], int]:
+    alg_block = content[algorithm_index]
+    code_body = (alg_block.get("code_body") or "").strip()
+    caption = (alg_block.get("caption") or "").strip()
+    sub_type = alg_block.get("sub_type") or "algorithm"
+
+    # Reuse equation context machinery: prose immediately before/after grounds the
+    # algorithm in its narrative, identical to how equations are contextualised.
+    previous_ctx, following_ctx, cue_flags = select_equation_context(
+        content, algorithm_index, config.max_context_blocks
+    )
+    before_text = "\n\n".join(
+        normalize_text(b.get("text")) for b in previous_ctx if normalize_text(b.get("text"))
+    )
+    after_text = "\n\n".join(
+        normalize_text(b.get("text")) for b in following_ctx if normalize_text(b.get("text"))
+    )
+
+    label = "Algorithm" if sub_type == "algorithm" else "Code"
+    parts = [
+        f"Section path: {' > '.join(section.get('section_path') or [section.get('section_title')])}",
+    ]
+    if caption:
+        parts.append(f"{label} caption: {caption}")
+    if before_text:
+        parts.append(f"Context before {label.lower()}:\n{before_text}")
+    parts.append(f"{label}:\n{code_body}")
+    if after_text:
+        parts.append(f"Context after {label.lower()}:\n{after_text}")
+
+    blocks = previous_ctx + [alg_block] + following_ctx
+    next_ordinal += 1
+    extra = {
+        "algorithm_body": code_body,
+        "algorithm_caption": caption or None,
+        "algorithm_sub_type": sub_type,
+        "algorithm_context": {
+            "previous_text_block_ids": [b.get("block_id") for b in previous_ctx],
+            "next_text_block_ids": [b.get("block_id") for b in following_ctx],
+            "previous_intro_cue": cue_flags["previous_intro_cue"],
+            "following_explanation_cue": cue_flags["following_explanation_cue"],
+            "one_sided_context_is_acceptable": cue_flags["one_sided_context_is_acceptable"],
+        },
+    }
+    chunk = make_chunk(paper_meta, section, blocks, "algorithm", "\n\n".join(parts), next_ordinal, extra)
+    relations = chunk["metadata"]["relations"]
+    relations["related_text_block_ids"] = [b.get("block_id") for b in previous_ctx + following_ctx]
+    relations["related_algorithm_block_ids"] = [alg_block.get("block_id")]
+
+    if not before_text and not after_text:
+        chunk["metadata"]["quality_flags"].append("algorithm_without_text_context")
+    elif not before_text or not after_text:
+        chunk["metadata"]["quality_flags"].append("algorithm_one_sided_context")
 
     return chunk, next_ordinal
 
@@ -441,7 +399,6 @@ def chunk_document(data: dict[str, Any], config: ChunkConfig) -> tuple[list[dict
         "paper_key": metadata.get("paper_key", "unknown"),
         "source_pdf": metadata.get("source_pdf", "unknown"),
         "paper_title": metadata.get("paper_title", metadata.get("paper_key", "unknown")),
-        "front_matter": metadata.get("front_matter"),
     }
     splitter = RecursiveTextSplitter(config.chunk_size, config.overlap)
     chunks: list[dict[str, Any]] = []
@@ -509,6 +466,33 @@ def chunk_document(data: dict[str, Any], config: ChunkConfig) -> tuple[list[dict
                 chunk, ordinal = chunk_image_group(paper_meta, section, content, start, end, ordinal)
                 chunks.append(chunk)
                 index = end + 1
+                continue
+
+            if btype == "algorithm":
+                chunk, ordinal = chunk_algorithm_block(paper_meta, section, content, index, ordinal, config)
+                chunks.append(chunk)
+                index += 1
+                continue
+
+            if btype == "list":
+                # Flatten list items into the prose accumulator as a single synthetic
+                # text block. Lists in content sections are enumerated prose (e.g.
+                # numbered hyperparameter sets, appendix table-of-contents entries);
+                # they carry no retrieval value distinct from surrounding prose.
+                items = block.get("items") or []
+                joined = "\n".join(f"- {it}" for it in items if it)
+                if joined:
+                    synthetic: dict[str, Any] = {
+                        "type": "text",
+                        "text": joined,
+                        "block_id": block.get("block_id"),
+                        "block_index": block.get("block_index"),
+                        "section_id": block.get("section_id"),
+                        "section_index": block.get("section_index"),
+                        "page_idx": block.get("page_idx"),
+                    }
+                    prose_accumulator.append(synthetic)
+                index += 1
                 continue
 
             index += 1

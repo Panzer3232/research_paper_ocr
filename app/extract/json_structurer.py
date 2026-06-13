@@ -8,8 +8,24 @@ from typing import Any
 from app.core.exceptions import ExtractionError
 
 
-_CONTENT_TYPES: frozenset[str] = frozenset({"text", "image", "table", "equation"})
-_DISCARD_TYPES: frozenset[str] = frozenset({"discarded"})
+_CONTENT_TYPES: frozenset[str] = frozenset({
+    "text",
+    "image",
+    "table",
+    "equation",
+    "code",    # algorithms and code blocks (sub_type: "algorithm" | "code")
+    "chart",   # data-visualization figures (has img_path + chart_caption)
+    "list",    # reference lists and enumerated items (sub_type: "ref_text" | "ol" | "ul")
+})
+_DISCARD_TYPES: frozenset[str] = frozenset({
+    "discarded",
+    # Page auxiliary block types — official MinerU docs, content_list.json spec:
+    "header",        # running page headers (journal name, section title in margin)
+    "footer",        # running page footers
+    "page_number",   # literal page numbers
+    "aside_text",    # margin notes, arXiv watermarks, rotated sidebar text
+    "page_footnote", # per-page footnotes (author affiliations, copyright lines)
+})
 
 # re.DOTALL so multiline GPT captions (containing \n) are captured in full.
 # .*? instead of [^\]]* so ] characters inside GPT captions do not break the match.
@@ -219,9 +235,18 @@ def _annotate_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
       1. image_caption list embedded in the block.
       2. image_footnote list embedded in the block.
 
+    Caption resolution for charts:
+      1. chart_caption list embedded in the block.
+      2. chart_footnote list embedded in the block.
+
+    Caption resolution for code/algorithm blocks:
+      1. code_caption list embedded in the block.
+      2. code_footnote list embedded in the block.
+
     Additional annotations:
-      _img_path  — on table and equation blocks (fallback rendered image).
+      _img_path    — on table, chart, and equation blocks (fallback rendered image).
       _text_format — on equation blocks (e.g. "latex").
+      _sub_type    — on code and list blocks (e.g. "algorithm", "ref_text").
     """
     result: list[dict[str, Any]] = [dict(b) for b in blocks]
     consumed: set[int] = set()
@@ -233,6 +258,7 @@ def _annotate_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cap = _join_string_list(block.get("table_caption") or [])
             fn = _join_string_list(block.get("table_footnote") or [])
             resolved = cap or fn
+
             if not resolved:
                 resolved, consumed_idx = _lookbehind_caption(result, i, consumed)
                 if consumed_idx is not None:
@@ -248,6 +274,21 @@ def _annotate_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cap = _join_string_list(block.get("image_caption") or [])
             fn = _join_string_list(block.get("image_footnote") or [])
             block["_resolved_caption"] = cap or fn
+
+        elif block_type == "chart":
+            cap = _join_string_list(block.get("chart_caption") or [])
+            fn = _join_string_list(block.get("chart_footnote") or [])
+            block["_resolved_caption"] = cap or fn
+            block["_img_path"] = block.get("img_path") or None
+
+        elif block_type == "code":
+            cap = _join_string_list(block.get("code_caption") or [])
+            fn = _join_string_list(block.get("code_footnote") or [])
+            block["_resolved_caption"] = cap or fn
+            block["_sub_type"] = block.get("sub_type") or None
+
+        elif block_type == "list":
+            block["_sub_type"] = block.get("sub_type") or None
 
         elif block_type == "equation":
             block["_img_path"] = block.get("img_path") or None
@@ -476,12 +517,51 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
             result["img_path"] = block["_img_path"]
         return result
 
+    if block_type == "chart":
+        caption_text = block.get("_resolved_caption") or ""
+        result = {
+            "type": "image",          # charts are visual figures; treated as image for RAG
+            "img_path": block.get("_img_path") or block.get("img_path"),
+            "caption": caption_text or None,
+            "page_idx": block.get("page_idx"),
+        }
+        return result
+
+    if block_type == "code":
+        body = (block.get("code_body") or "").strip()
+        if not body:
+            return None
+        result = {
+            "type": "algorithm",
+            "code_body": body,
+            "page_idx": block.get("page_idx"),
+        }
+        caption_text = block.get("_resolved_caption") or ""
+        if caption_text:
+            result["caption"] = caption_text
+        if block.get("_sub_type"):
+            result["sub_type"] = block["_sub_type"]
+        return result
+
+    if block_type == "list":
+        items: list[str] = [
+            str(it).strip() for it in (block.get("list_items") or [])
+            if str(it).strip()
+        ]
+        if not items:
+            return None
+        result = {
+            "type": "list",
+            "items": items,
+            "page_idx": block.get("page_idx"),
+        }
+        if block.get("_sub_type"):
+            result["sub_type"] = block["_sub_type"]
+        return result
+
     return None
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
 
 def _infer_total_pages(blocks: list[dict[str, Any]]) -> int:
     pages = [b.get("page_idx", 0) for b in blocks if isinstance(b.get("page_idx"), int)]

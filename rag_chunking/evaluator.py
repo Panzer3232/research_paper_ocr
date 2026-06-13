@@ -21,7 +21,12 @@ def _preview(text: str, n: int = 160) -> str:
 
 
 def _has_natural_context(text: str) -> bool:
-    cleaned = text.replace("Equation LaTeX:", "")
+    cleaned = (
+        text
+        .replace("Equation LaTeX:", "")
+        .replace("Algorithm:", "")
+        .replace("Code:", "")
+    )
     return sentence_like(cleaned)
 
 
@@ -130,6 +135,26 @@ def evaluate_chunks(
         if not meta.get("llm_caption_count"):
             figures_missing_llm.append({"chunk_id": c.get("chunk_id"), "preview": _preview(c.get("text", ""))})
 
+    algorithm_chunks = [c for c in chunks if c.get("type") == "algorithm"]
+    algorithm_without_context = []
+    algorithm_one_sided_needs_review = []
+    algorithm_missing_body = []
+    algorithm_body_only = []
+    for c in algorithm_chunks:
+        meta = c.get("metadata", {})
+        context = meta.get("algorithm_context", {})
+        prev_ids = context.get("previous_text_block_ids") or []
+        next_ids = context.get("next_text_block_ids") or []
+        body = meta.get("algorithm_body") or ""
+        if not body:
+            algorithm_missing_body.append({"chunk_id": c.get("chunk_id"), "preview": _preview(c.get("text", ""))})
+        if not prev_ids and not next_ids:
+            algorithm_without_context.append({"chunk_id": c.get("chunk_id"), "preview": _preview(c.get("text", ""))})
+        if (not prev_ids or not next_ids) and not context.get("one_sided_context_is_acceptable"):
+            algorithm_one_sided_needs_review.append({"chunk_id": c.get("chunk_id"), "preview": _preview(c.get("text", ""))})
+        if not _has_natural_context(c.get("text", "")):
+            algorithm_body_only.append({"chunk_id": c.get("chunk_id"), "preview": _preview(c.get("text", ""))})
+
     relation_neighbor_gaps = []
     for idx, c in enumerate(chunks):
         relations = c.get("metadata", {}).get("relations", {})
@@ -152,6 +177,9 @@ def evaluate_chunks(
             equation_without_context,
             equation_missing_latex,
             equation_only,
+            algorithm_without_context,
+            algorithm_missing_body,
+            algorithm_body_only,
             relation_neighbor_gaps,
         ]
     )
@@ -167,6 +195,7 @@ def evaluate_chunks(
             table_oversized,
             figures_missing_caption,
             figures_missing_llm,
+            algorithm_one_sided_needs_review,
         ]
     )
 
@@ -213,5 +242,19 @@ def evaluate_chunks(
             "status": _status(len(figures_missing_caption) + len(figures_missing_llm)),
             "caption_examples": figures_missing_caption[:10],
             "llm_caption_examples": figures_missing_llm[:10],
+        },
+        "algorithm_quality": {
+            "total": len(algorithm_chunks),
+            "without_context": len(algorithm_without_context),
+            "one_sided_needs_review": len(algorithm_one_sided_needs_review),
+            "missing_body": len(algorithm_missing_body),
+            "body_only": len(algorithm_body_only),
+            "status": _status(
+                len(algorithm_without_context) + len(algorithm_missing_body) + len(algorithm_body_only),
+                fail=True,
+            ),
+            "without_context_examples": algorithm_without_context[:10],
+            "one_sided_review_examples": algorithm_one_sided_needs_review[:10],
+            "body_only_examples": algorithm_body_only[:10],
         },
     }

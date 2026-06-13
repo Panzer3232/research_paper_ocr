@@ -26,6 +26,8 @@ class JobEntry:
     export_json: bool
     chunk: bool
     evaluate: bool
+    wait: bool
+    wait_timeout_seconds: int
     config_overrides: dict
     submitted_at: str
     process: multiprocessing.Process
@@ -123,12 +125,50 @@ def _state() -> AppState:
 
 
 class JobSubmitRequest(BaseModel):
-    input_path: str = Field(..., description="Absolute path to a PDF file or directory of PDFs.")
-    output_dir: str | None = Field(None, description="Override output root directory for this job.")
-    caption: bool = Field(False, description="Enable GPT image captioning during OCR.")
-    export_json: bool = Field(False, description="Export structured RAG-ready JSON after OCR.")
-    chunk: bool = Field(False, description="Run RAG chunking pipeline after OCR. Forces export_json=True internally.")
-    evaluate: bool = Field(False, description="Run chunk quality evaluation after chunking. Has no effect when chunk=False.")
+    input_path: str = Field(
+        ...,
+        description="Absolute path to a PDF file or directory of PDFs.",
+    )
+    output_dir: str | None = Field(
+        None,
+        description="Override output root directory for this job.",
+    )
+    caption: bool = Field(
+        False,
+        description="Enable GPT image captioning during OCR.",
+    )
+    export_json: bool = Field(
+        False,
+        description="Export structured RAG-ready JSON after OCR.",
+    )
+    chunk: bool = Field(
+        False,
+        description="Run RAG chunking pipeline after OCR. Forces export_json=True internally.",
+    )
+    evaluate: bool = Field(
+        False,
+        description="Run chunk quality evaluation after chunking. Has no effect when chunk=False.",
+    )
+    wait: bool = Field(
+        False,
+        description=(
+            "When True, the request blocks until the full pipeline completes and returns "
+            "the result directly (HTTP 200). When False (default), the server returns "
+            "HTTP 202 immediately and the caller must poll GET /jobs/{job_id} for status."
+        ),
+    )
+    wait_timeout_seconds: int = Field(
+        default=-1,
+        ge=-1,
+        description=(
+            "Maximum seconds the server will wait for the pipeline when wait=True. "
+            "Pass -1 (default) to use the server's DEFAULT_WAIT_TIMEOUT_SECONDS. "
+            "Any positive value is silently clamped to MAX_WAIT_TIMEOUT_SECONDS. "
+            "Has no effect when wait=False. "
+            "Ensure your HTTP client's socket timeout exceeds this value so the server "
+            "can return a clean 504 before the client drops the connection."
+        ),
+    )
     overrides: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -157,6 +197,8 @@ def _entry_to_dict(entry: JobEntry) -> dict:
         "export_json": entry.export_json,
         "chunk": entry.chunk,
         "evaluate": entry.evaluate,
+        "wait": entry.wait,
+        "wait_timeout_seconds": entry.wait_timeout_seconds,
         "config_overrides": entry.config_overrides,
         "submitted_at": entry.submitted_at,
         "finished_at": entry.finished_at,
@@ -171,40 +213,16 @@ def _result_file_path(job_id: str) -> str:
     return str(results_dir / f"{job_id}.json")
 
 
-@app.get("/health", tags=["meta"])
-def health():
-    state = _state()
-    active = state.active_count()
-    return {
-        "status": "ok",
-        "active_processes": active,
-        "max_concurrent_processes": state.max_concurrent,
-        "capacity_available": active < state.max_concurrent,
-    }
-
-
-@app.post("/jobs", status_code=202, tags=["jobs"])
-def submit_job(body: JobSubmitRequest):
-    state = _state()
-
-    input_path = Path(body.input_path)
-    if not input_path.exists():
-        raise HTTPException(status_code=422, detail=f"input_path does not exist: {input_path}")
-
-    active = state.active_count()
-    if active >= state.max_concurrent:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": (
-                    f"Pipeline at capacity: {active}/{state.max_concurrent} processes running. "
-                    "Come back when GPU is free."
-                ),
-                "active_processes": active,
-                "max_concurrent_processes": state.max_concurrent,
-            },
-        )
-
+def _spawn_job(
+    body: JobSubmitRequest,
+    state: AppState,
+    effective_wait_timeout: int,
+) -> tuple[JobEntry, multiprocessing.Process]:
+    """
+    Construct, start, and register a child process for the given job request.
+    effective_wait_timeout is the already-resolved and clamped timeout value,
+    computed by the route handler from APIConfig before calling this function.
+    """
     job_id = str(uuid.uuid4())
     result_path = _result_file_path(job_id)
 
@@ -239,20 +257,121 @@ def submit_job(body: JobSubmitRequest):
         export_json=body.export_json,
         chunk=body.chunk,
         evaluate=body.evaluate,
+        wait=body.wait,
+        wait_timeout_seconds=effective_wait_timeout,
         config_overrides=body.overrides,
         submitted_at=_utc_now(),
         process=process,
         result_path=result_path,
     )
     state.register(entry)
+    return entry, process
 
+
+@app.get("/health", tags=["meta"])
+def health():
+    state = _state()
+    active = state.active_count()
     return {
-        "job_id": job_id,
-        "status": "running",
-        "pid": process.pid,
-        "submitted_at": entry.submitted_at,
-        "message": "Job accepted. Poll GET /jobs/{job_id} for status.",
+        "status": "ok",
+        "active_processes": active,
+        "max_concurrent_processes": state.max_concurrent,
+        "capacity_available": active < state.max_concurrent,
     }
+
+
+@app.post("/jobs", status_code=202, tags=["jobs"])
+def submit_job(body: JobSubmitRequest):
+    """
+    Submit an OCR + optional RAG chunking job.
+
+    **Async mode** (wait=False, default):
+      Returns HTTP 202 immediately. Poll GET /jobs/{job_id} for completion.
+
+    **Sync mode** (wait=True):
+      Blocks until the full pipeline finishes (or the effective wait timeout elapses)
+      and returns the complete result with HTTP 200. On timeout, returns HTTP 504
+      with the job_id so the caller can fall back to polling.
+
+    The caller's HTTP socket timeout must exceed the effective wait_timeout_seconds
+    to guarantee the server can deliver a clean 504 before the client drops the
+    connection.
+    """
+    state = _state()
+    cfg = state.api_config
+
+    input_path = Path(body.input_path)
+    if not input_path.exists():
+        raise HTTPException(
+            status_code=422,
+            detail=f"input_path does not exist: {input_path}",
+        )
+
+    active = state.active_count()
+    if active >= state.max_concurrent:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    f"Pipeline at capacity: {active}/{state.max_concurrent} processes running. "
+                    "Come back when GPU is free."
+                ),
+                "active_processes": active,
+                "max_concurrent_processes": state.max_concurrent,
+            },
+        )
+
+    # Resolve the effective timeout:
+    #   -1 sentinel  → server default
+    #   any positive → clamped to server maximum
+    if body.wait_timeout_seconds == -1:
+        effective_wait_timeout = cfg.default_wait_timeout_seconds
+    else:
+        effective_wait_timeout = min(body.wait_timeout_seconds, cfg.max_wait_timeout_seconds)
+
+    entry, process = _spawn_job(body, state, effective_wait_timeout)
+
+    if not body.wait:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": entry.job_id,
+                "status": "running",
+                "pid": process.pid,
+                "submitted_at": entry.submitted_at,
+                "message": "Job accepted. Poll GET /jobs/{job_id} for status.",
+            },
+        )
+
+    # --- Synchronous (blocking) path ---
+    # submit_job is a plain `def` (not async def), so FastAPI runs it in a
+    # thread pool executor. Blocking here with process.join() is safe: it stalls
+    # this thread only, not the event loop or any other concurrent requests.
+    process.join(timeout=effective_wait_timeout)
+
+    if process.is_alive():
+        # Timeout elapsed. The process is still running. Do not kill it —
+        # the GPU job should continue. The caller can poll GET /jobs/{job_id}.
+        return JSONResponse(
+            status_code=504,
+            content={
+                "detail": (
+                    f"Pipeline did not complete within {effective_wait_timeout}s. "
+                    "The job is still running. Poll GET /jobs/{job_id} for status."
+                ),
+                "job_id": entry.job_id,
+                "status": "running",
+                "submitted_at": entry.submitted_at,
+            },
+        )
+
+    # Process has exited. Resolve its final status from the result file.
+    state.refresh_status(entry)
+
+    return JSONResponse(
+        status_code=200,
+        content=_entry_to_dict(entry),
+    )
 
 
 @app.get("/jobs/{job_id}", tags=["jobs"])
