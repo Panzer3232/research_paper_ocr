@@ -20,11 +20,11 @@ _CONTENT_TYPES: frozenset[str] = frozenset({
 _DISCARD_TYPES: frozenset[str] = frozenset({
     "discarded",
     # Page auxiliary block types — official MinerU docs, content_list.json spec:
-    "header",        # running page headers (journal name, section title in margin)
-    "footer",        # running page footers
-    "page_number",   # literal page numbers
-    "aside_text",    # margin notes, arXiv watermarks, rotated sidebar text
-    "page_footnote", # per-page footnotes (author affiliations, copyright lines)
+    "header",       # running page headers (journal name, section title in margin)
+    "footer",       # running page footers
+    "page_number",  # literal page numbers
+    "aside_text",   # margin notes, arXiv watermarks, rotated sidebar text
+    # page_footnote is NOT discarded — collected separately into page_footnotes.
 })
 
 # re.DOTALL so multiline GPT captions (containing \n) are captured in full.
@@ -93,7 +93,7 @@ def build_structured_json(
     md_path = captioned_markdown_path
     if md_path is not None:
         _inject_markdown_images(sections, md_path, llm_captions)
-    
+
     # Apply LLM captions to image blocks that already came from content_list.json.
     if llm_captions:
         _apply_llm_captions(sections, llm_captions)
@@ -219,34 +219,36 @@ def _join_string_list(items: list[Any]) -> str:
 
 def _annotate_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Shallow-copy all blocks and attach resolved caption / fallback fields before
+    Shallow-copy all blocks and attach resolved caption / footnote fields before
     grouping into sections.
 
     Caption resolution order for tables:
       1. table_caption list embedded in the block.
-      2. table_footnote list embedded in the block.
-      3. Immediately preceding text block matching _FLOAT_CAPTION_RE (lookbehind).
+      2. Immediately preceding text block matching _FLOAT_CAPTION_RE (lookbehind).
          Handles the case where MinerU places the caption text between a preceding
          image and the table (e.g. "Table 6: ...").
-      4. First following text block matching _FLOAT_CAPTION_RE (lookahead).
+      3. First following text block matching _FLOAT_CAPTION_RE (lookahead).
          Consumed so it is not also emitted as a body text block.
+      table_footnote is resolved independently into _resolved_footnote and is
+      never used as a caption substitute.
 
     Caption resolution order for images:
       1. image_caption list embedded in the block.
-      2. image_footnote list embedded in the block.
+      image_footnote is resolved independently into _resolved_footnote.
 
     Caption resolution for charts:
       1. chart_caption list embedded in the block.
-      2. chart_footnote list embedded in the block.
+      chart_footnote is resolved independently into _resolved_footnote.
 
     Caption resolution for code/algorithm blocks:
       1. code_caption list embedded in the block.
-      2. code_footnote list embedded in the block.
+      code_footnote is resolved independently into _resolved_footnote.
 
     Additional annotations:
-      _img_path    — on table, chart, and equation blocks (fallback rendered image).
-      _text_format — on equation blocks (e.g. "latex").
-      _sub_type    — on code and list blocks (e.g. "algorithm", "ref_text").
+      _img_path         — on table, chart, and equation blocks (fallback rendered image).
+      _text_format      — on equation blocks (e.g. "latex").
+      _sub_type         — on code and list blocks (e.g. "algorithm", "ref_text").
+      _resolved_footnote — on image, table, chart, and code blocks when a footnote exists.
     """
     result: list[dict[str, Any]] = [dict(b) for b in blocks]
     consumed: set[int] = set()
@@ -256,9 +258,9 @@ def _annotate_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         if block_type == "table":
             cap = _join_string_list(block.get("table_caption") or [])
-            fn = _join_string_list(block.get("table_footnote") or [])
-            resolved = cap or fn
+            fn  = _join_string_list(block.get("table_footnote") or [])
 
+            resolved = cap
             if not resolved:
                 resolved, consumed_idx = _lookbehind_caption(result, i, consumed)
                 if consumed_idx is not None:
@@ -268,23 +270,31 @@ def _annotate_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if consumed_idx is not None:
                     consumed.add(consumed_idx)
             block["_resolved_caption"] = resolved
+            if fn:
+                block["_resolved_footnote"] = fn
             block["_img_path"] = block.get("img_path") or None
 
         elif block_type == "image":
             cap = _join_string_list(block.get("image_caption") or [])
-            fn = _join_string_list(block.get("image_footnote") or [])
-            block["_resolved_caption"] = cap or fn
+            fn  = _join_string_list(block.get("image_footnote") or [])
+            block["_resolved_caption"] = cap
+            if fn:
+                block["_resolved_footnote"] = fn
 
         elif block_type == "chart":
             cap = _join_string_list(block.get("chart_caption") or [])
-            fn = _join_string_list(block.get("chart_footnote") or [])
-            block["_resolved_caption"] = cap or fn
+            fn  = _join_string_list(block.get("chart_footnote") or [])
+            block["_resolved_caption"] = cap
+            if fn:
+                block["_resolved_footnote"] = fn
             block["_img_path"] = block.get("img_path") or None
 
         elif block_type == "code":
             cap = _join_string_list(block.get("code_caption") or [])
-            fn = _join_string_list(block.get("code_footnote") or [])
-            block["_resolved_caption"] = cap or fn
+            fn  = _join_string_list(block.get("code_footnote") or [])
+            block["_resolved_caption"] = cap
+            if fn:
+                block["_resolved_footnote"] = fn
             block["_sub_type"] = block.get("sub_type") or None
 
         elif block_type == "list":
@@ -434,6 +444,16 @@ def _group_into_sections(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
             continue
 
+        if block_type == "page_footnote":
+            text = (block.get("text") or "").strip()
+            if text and current_section is not None:
+                current_section["content"].append({
+                    "type": "page_footnote",
+                    "text": text,
+                    "page_idx": block.get("page_idx"),
+                })
+            continue
+
         if block_type not in _CONTENT_TYPES:
             continue
 
@@ -456,7 +476,8 @@ def _group_into_sections(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _is_heading(block: dict[str, Any]) -> bool:
-    return block.get("type") == "text" and "text_level" in block
+    # text_level: 0 is body text per MinerU spec; only levels >= 1 are headings.
+    return block.get("type") == "text" and bool(block.get("text_level"))
 
 
 def _new_section(*, title: str, level: int, page_start: int) -> dict[str, Any]:
@@ -484,12 +505,15 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
 
     if block_type == "image":
         caption_text = block.get("_resolved_caption") or ""
-        return {
+        result = {
             "type": "image",
             "img_path": block.get("img_path"),
             "caption": caption_text or None,
             "page_idx": block.get("page_idx"),
         }
+        if block.get("_resolved_footnote"):
+            result["footnote"] = block["_resolved_footnote"]
+        return result
 
     if block_type == "table":
         caption_text = block.get("_resolved_caption") or ""
@@ -502,6 +526,8 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
         }
         if block.get("_img_path"):
             result["img_path"] = block["_img_path"]
+        if block.get("_resolved_footnote"):
+            result["footnote"] = block["_resolved_footnote"]
         return result
 
     if block_type == "equation":
@@ -525,6 +551,8 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
             "caption": caption_text or None,
             "page_idx": block.get("page_idx"),
         }
+        if block.get("_resolved_footnote"):
+            result["footnote"] = block["_resolved_footnote"]
         return result
 
     if block_type == "code":
@@ -532,7 +560,7 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
         if not body:
             return None
         result = {
-            "type": "algorithm",
+            "type": "code",
             "code_body": body,
             "page_idx": block.get("page_idx"),
         }
@@ -541,6 +569,8 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
             result["caption"] = caption_text
         if block.get("_sub_type"):
             result["sub_type"] = block["_sub_type"]
+        if block.get("_resolved_footnote"):
+            result["footnote"] = block["_resolved_footnote"]
         return result
 
     if block_type == "list":
@@ -560,7 +590,6 @@ def _normalise_block(block: dict[str, Any]) -> dict[str, Any] | None:
         return result
 
     return None
-
 
 
 def _infer_total_pages(blocks: list[dict[str, Any]]) -> int:

@@ -66,7 +66,8 @@ def normalize_blocks(
             }
         )
 
-        if btype == "text":
+        if btype in ("text", "page_footnote"):
+            # page_footnote is treated identically to text here, and downstream in
             text, trimmed_checklist_tail = strip_checklist_tail(block.get("text"))
             if trimmed_checklist_tail:
                 drops["trimmed_checklist_tail"] = drops.get("trimmed_checklist_tail", 0) + 1
@@ -74,7 +75,8 @@ def normalize_blocks(
                 drops["checklist_text"] = drops.get("checklist_text", 0) + 1
                 continue
             if drop_invalid_blocks and is_noise_text(text):
-                drops["noise_text"] = drops.get("noise_text", 0) + 1
+                noise_key = "noise_text" if btype == "text" else "noise_page_footnote"
+                drops[noise_key] = drops.get(noise_key, 0) + 1
                 continue
             block["text"] = text
 
@@ -93,21 +95,24 @@ def normalize_blocks(
                 continue
             block["caption"] = normalize_text(block.get("caption")) or None
             block["table_body"] = table_body
+            block["footnote"] = normalize_text(block.get("footnote")) or None
 
         elif btype == "image":
             block["caption"] = normalize_text(block.get("caption")) or None
             block["caption_llm"] = normalize_text(block.get("caption_llm")) or None
+            block["footnote"] = normalize_text(block.get("footnote")) or None
             if drop_invalid_blocks and not block.get("caption") and not block.get("caption_llm") and not block.get("img_path"):
                 drops["empty_image"] = drops.get("empty_image", 0) + 1
                 continue
 
-        elif btype == "algorithm":
+        elif btype in ("algorithm", "code"):
             code_body = (block.get("code_body") or "").strip()
             if drop_invalid_blocks and not code_body:
                 drops["empty_algorithm"] = drops.get("empty_algorithm", 0) + 1
                 continue
             block["code_body"] = code_body
             block["caption"] = normalize_text(block.get("caption")) or None
+            block["footnote"] = normalize_text(block.get("footnote")) or None
             # sub_type distinguishes pseudocode ("algorithm") from verbatim code ("code").
             # Preserve it as-is; downstream chunker uses it for chunk text labelling.
             block["sub_type"] = block.get("sub_type") or "algorithm"

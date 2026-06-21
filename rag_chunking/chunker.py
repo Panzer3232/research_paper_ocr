@@ -176,6 +176,7 @@ def chunk_algorithm_block(
     alg_block = content[algorithm_index]
     code_body = (alg_block.get("code_body") or "").strip()
     caption = (alg_block.get("caption") or "").strip()
+    footnote = normalize_text(alg_block.get("footnote")) or None
     sub_type = alg_block.get("sub_type") or "algorithm"
 
     # Reuse equation context machinery: prose immediately before/after grounds the
@@ -201,12 +202,15 @@ def chunk_algorithm_block(
     parts.append(f"{label}:\n{code_body}")
     if after_text:
         parts.append(f"Context after {label.lower()}:\n{after_text}")
+    if footnote:
+        parts.append(f"{label} footnote: {footnote}")
 
     blocks = previous_ctx + [alg_block] + following_ctx
     next_ordinal += 1
     extra = {
         "algorithm_body": code_body,
         "algorithm_caption": caption or None,
+        "algorithm_footnote": footnote,
         "algorithm_sub_type": sub_type,
         "algorithm_context": {
             "previous_text_block_ids": [b.get("block_id") for b in previous_ctx],
@@ -229,6 +233,24 @@ def chunk_algorithm_block(
     return chunk, next_ordinal
 
 
+def chunk_page_footnote_block(
+    paper_meta: dict[str, Any],
+    section: dict[str, Any],
+    footnote_block: dict[str, Any],
+    next_ordinal: int,
+) -> tuple[dict[str, Any], int]:
+    footnote_text = normalize_text(footnote_block.get("text"))
+    next_ordinal += 1
+    extra = {
+        "is_page_footnote": True,
+        "prose_part_index": 0,
+        "prose_part_count": 1,
+        "splitter_backend": "page_footnote_passthrough",
+    }
+    chunk = make_chunk(paper_meta, section, [footnote_block], "prose", footnote_text, next_ordinal, extra)
+    return chunk, next_ordinal
+
+
 def chunk_table_block(
     paper_meta: dict[str, Any],
     section: dict[str, Any],
@@ -240,6 +262,7 @@ def chunk_table_block(
     table_block = content[table_index]
     refs = find_table_reference_text(content, table_index)
     caption, caption_source = recover_table_caption(table_block, refs, section.get("section_title") or "")
+    footnote = normalize_text(table_block.get("footnote")) or None
     parts = table_parts(
         table_block.get("table_body") or "",
         caption,
@@ -257,6 +280,8 @@ def chunk_table_block(
             ref_text = "\n".join(normalize_text(b.get("text")) for b in refs)
             text_parts.append(f"Nearby table reference text:\n{ref_text}")
         text_parts.append(f"Table rows:\n{part['text']}")
+        if footnote:
+            text_parts.append(f"Table footnote: {footnote}")
         text = "\n\n".join(p for p in text_parts if p)
 
         next_ordinal += 1
@@ -264,6 +289,7 @@ def chunk_table_block(
             "table_caption": caption,
             "table_caption_source": caption_source,
             "table_img_path": table_block.get("img_path"),
+            "table_footnote": footnote,
             "table_part_index": part["part_index"],
             "table_part_count": part["part_count"],
             "table_row_start": part["row_start"],
@@ -297,6 +323,7 @@ def chunk_image_group(
     refs = find_figure_reference_text(content, start_index, end_index)
     caption, caption_source = recover_figure_caption(image_blocks, refs, section.get("section_title") or "")
     llm_captions = [normalize_text(b.get("caption_llm")) for b in image_blocks if normalize_text(b.get("caption_llm"))]
+    image_footnotes = [normalize_text(b.get("footnote")) for b in image_blocks if normalize_text(b.get("footnote"))]
     image_paths = [b.get("img_path") for b in image_blocks if b.get("img_path")]
 
     text_parts = [
@@ -307,6 +334,8 @@ def chunk_image_group(
         text_parts.append("Nearby figure reference text:\n" + "\n".join(normalize_text(b.get("text")) for b in refs))
     if llm_captions:
         text_parts.append("Image summaries:\n" + "\n".join(f"- {caption_text}" for caption_text in llm_captions))
+    if image_footnotes:
+        text_parts.append("Image footnotes:\n" + "\n".join(f"- {fn}" for fn in image_footnotes))
 
     next_ordinal += 1
     extra = {
@@ -314,6 +343,7 @@ def chunk_image_group(
         "figure_caption_source": caption_source,
         "figure_group_size": len(image_blocks),
         "image_paths": image_paths,
+        "image_footnotes": image_footnotes,
         "llm_caption_count": len(llm_captions),
         "figure_reference_text_block_ids": [b.get("block_id") for b in refs],
     }
@@ -336,6 +366,14 @@ def merge_short_prose_chunks(chunks: list[dict[str, Any]], min_tokens: int) -> l
     i = 0
     while i < len(chunks):
         current = chunks[i]
+        # page_footnote chunks are prose-typed by design (chunk_page_footnote_block) but
+        # must stay standalone: merging would silently drop is_page_footnote, since this
+        # function only carries source_block_ids/source_block_indices/estimated_tokens
+        # across a merge, not arbitrary extra metadata.
+        if current.get("metadata", {}).get("is_page_footnote"):
+            merged.append(current)
+            i += 1
+            continue
         if current.get("type") != "prose" or estimate_tokens(current.get("text")) >= min_tokens:
             merged.append(current)
             i += 1
@@ -345,11 +383,13 @@ def merge_short_prose_chunks(chunks: list[dict[str, Any]], min_tokens: int) -> l
         can_merge_next = (
             i + 1 < len(chunks)
             and chunks[i + 1].get("type") == "prose"
+            and not chunks[i + 1].get("metadata", {}).get("is_page_footnote")
             and chunks[i + 1].get("metadata", {}).get("section_id") == section_id
         )
         can_merge_prev = (
             merged
             and merged[-1].get("type") == "prose"
+            and not merged[-1].get("metadata", {}).get("is_page_footnote")
             and merged[-1].get("metadata", {}).get("section_id") == section_id
         )
 
@@ -446,6 +486,12 @@ def chunk_document(data: dict[str, Any], config: ChunkConfig) -> tuple[list[dict
 
             flush_prose()
 
+            if btype == "page_footnote":
+                chunk, ordinal = chunk_page_footnote_block(paper_meta, section, block, ordinal)
+                chunks.append(chunk)
+                index += 1
+                continue
+
             if btype == "equation":
                 chunk, ordinal = chunk_equation_block(paper_meta, section, content, index, ordinal, config)
                 chunks.append(chunk)
@@ -468,7 +514,7 @@ def chunk_document(data: dict[str, Any], config: ChunkConfig) -> tuple[list[dict
                 index = end + 1
                 continue
 
-            if btype == "algorithm":
+            if btype in ("algorithm", "code"):
                 chunk, ordinal = chunk_algorithm_block(paper_meta, section, content, index, ordinal, config)
                 chunks.append(chunk)
                 index += 1
